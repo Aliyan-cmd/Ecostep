@@ -1,0 +1,14 @@
+groups:
+  - name: ecostep_ingestion_alerts
+    rules:
+      - alert: HighIngestionErrorRate
+        expr: |
+          sum(rate(app_request_count{endpoint="/api/v1/ingest/webhook", http_status=~"5.."}[5m])) 
+          / 
+          sum(rate(app_request_count{endpoint="/api/v1/ingest/webhook"}[5m])) > 0.02
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High 5xx error rate on ingestion webhook"
+          description: "Over 2% of incoming API payloads are failing over the last 5 minutes. Immediate investigation required to prevent data loss."

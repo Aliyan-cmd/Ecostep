@@ -1,0 +1,19 @@
+FROM python:3.14-slim
+
+WORKDIR /app
+
+# Install standard production runtime dependencies
+# Copy the FastAPI app and requirement definitions
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt cryptography
+
+# Secure file ownership (Principle of least privilege)
+COPY . .
+RUN useradd -m ecostep && chown -R ecostep /app
+USER ecostep
+
+# Expose Uvicorn port
+EXPOSE 8000
+
+# Execute server explicitly
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers"]
