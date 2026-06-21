@@ -1,8 +1,8 @@
-from fastapi import FastAPI, HTTPException, status, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, status, Request, UploadFile, File, Depends
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, ValidationError
-from typing import Literal, Optional, Dict, Any, Union
-from datetime import datetime
+from typing import Literal, Optional, Dict, Any
+from datetime import datetime, UTC
 import uuid
 import time
 import sys
@@ -10,8 +10,9 @@ import os
 from nudge_engine import UserContextPayload, NudgeRecommendation, evaluate_nudges
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from ai.scanner import parse_receipt_image
-from fintech.roundup import eco_roundup_engine
+from src.ai.scanner import parse_receipt_image
+from src.fintech.roundup import eco_roundup_engine
+from src.routes.auth import router as auth_router, get_current_user
 
 # Prometheus Metrics Telemetry
 try:
@@ -27,6 +28,21 @@ app = FastAPI(
     description="Calculates carbon footprint and ingests webhooks for Phase 2.",
     version="1.1.0"
 )
+
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router)
+
+@app.get("/health", summary="Health check")
+def health():
+    return {"status": "ok", "version": "1.1.0"}
 
 @app.middleware("http")
 async def prometheus_telemetry_middleware(request: Request, call_next):
@@ -117,61 +133,72 @@ class WebhookResponse(BaseModel):
     message: str
     ledger_preview: Optional[CalculationResponse] = None
 
-# --- Core Calculation Endpoints (Phase 1) ---
+# --- Pure Calculation Helpers (no auth dependency) ---
 
-@app.post("/calculate/transport", response_model=CalculationResponse)
-def calculate_transport(request: TransportRequest):
-    factor = TRANSPORT_FACTORS[request.sub_category]
-    co2e = request.distance_miles * factor
+def _calc_transport(req: TransportRequest) -> CalculationResponse:
+    factor = TRANSPORT_FACTORS[req.sub_category]
+    co2e = req.distance_miles * factor
     return CalculationResponse(
         ledger_id=str(uuid.uuid4()),
         category="TRANSPORT",
-        sub_category=request.sub_category,
-        raw_quantity=request.distance_miles,
+        sub_category=req.sub_category,
+        raw_quantity=req.distance_miles,
         unit="miles",
         computed_co2e_kg=round(co2e, 4),
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(UTC)
     )
 
-@app.post("/calculate/utility", response_model=CalculationResponse)
-def calculate_utility(request: UtilityRequest):
-    if request.sub_category == "electricity_kwh":
-        if not request.grid_zone:
+def _calc_utility(req: UtilityRequest) -> CalculationResponse:
+    if req.sub_category == "electricity_kwh":
+        if not req.grid_zone:
             raise HTTPException(status_code=422, detail="grid_zone is required for electricity_kwh")
-        factor = GRID_ZONES[request.grid_zone]
+        factor = GRID_ZONES[req.grid_zone]
         unit = "kWh"
     else:
-        factor = UTILITY_FACTORS[request.sub_category]
+        factor = UTILITY_FACTORS[req.sub_category]
         unit = "therms"
-    co2e = request.quantity * factor
+    co2e = req.quantity * factor
     return CalculationResponse(
         ledger_id=str(uuid.uuid4()),
         category="UTILITIES",
-        sub_category=request.sub_category,
-        raw_quantity=request.quantity,
+        sub_category=req.sub_category,
+        raw_quantity=req.quantity,
         unit=unit,
         computed_co2e_kg=round(co2e, 4),
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(UTC)
     )
 
-@app.post("/calculate/diet", response_model=CalculationResponse)
-def calculate_diet(request: DietRequest):
-    factor = DIET_FACTORS[request.sub_category]
-    co2e = request.days * factor
+def _calc_diet(req: DietRequest) -> CalculationResponse:
+    factor = DIET_FACTORS[req.sub_category]
+    co2e = req.days * factor
     return CalculationResponse(
         ledger_id=str(uuid.uuid4()),
         category="DIET",
-        sub_category=request.sub_category,
-        raw_quantity=request.days,
+        sub_category=req.sub_category,
+        raw_quantity=req.days,
         unit="days",
         computed_co2e_kg=round(co2e, 4),
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(UTC)
     )
+
+# --- Core Calculation Endpoints (Phase 1) ---
+
+@app.post("/calculate/transport", response_model=CalculationResponse)
+def calculate_transport(request: TransportRequest, current_user: dict = Depends(get_current_user)):
+    return _calc_transport(request)
+
+@app.post("/calculate/utility", response_model=CalculationResponse)
+def calculate_utility(request: UtilityRequest, current_user: dict = Depends(get_current_user)):
+    return _calc_utility(request)
+
+@app.post("/calculate/diet", response_model=CalculationResponse)
+def calculate_diet(request: DietRequest, current_user: dict = Depends(get_current_user)):
+    return _calc_diet(request)
 
 # --- Ingestion Endpoint (Phase 2) ---
 
 @app.post("/api/v1/ingest/webhook", response_model=WebhookResponse, status_code=status.HTTP_202_ACCEPTED)
-def ingest_webhook(request: WebhookIngestRequest):
+def ingest_webhook(request: WebhookIngestRequest, current_user: dict = Depends(get_current_user)):
     task_id = str(uuid.uuid4())
     calc_res = None
     
@@ -179,47 +206,43 @@ def ingest_webhook(request: WebhookIngestRequest):
         if request.source == "smart_utility":
             if "kwh_used" not in request.payload:
                 raise HTTPException(status_code=422, detail="Missing 'kwh_used' parameter in smart utility payload")
-            calc_req = UtilityRequest(
+            req = UtilityRequest(
                 sub_category="electricity_kwh",
                 quantity=request.payload["kwh_used"],
-                grid_zone="AEO_NATIONAL"  # Default fallback for mock
+                grid_zone="AEO_NATIONAL"
             )
-            calc_res = calculate_utility(calc_req)
+            calc_res = _calc_utility(req)
             
         elif request.source == "mobility":
             if "distance_miles" not in request.payload:
                 raise HTTPException(status_code=422, detail="Missing 'distance_miles' parameter in mobility payload")
             activity = request.payload.get("activity", "driving")
-            # Map activity to transport sub_categories
+            sub_category = "gasoline_car"
             if activity == "driving":
                 sub_category = "gasoline_car"
             elif activity == "transit":
                 sub_category = "public_transit"
-            else:
-                sub_category = "gasoline_car"
-                
-            calc_req = TransportRequest(
+            req = TransportRequest(
                 sub_category=sub_category,
                 distance_miles=request.payload["distance_miles"]
             )
-            calc_res = calculate_transport(calc_req)
+            calc_res = _calc_transport(req)
             
         elif request.source == "manual":
             category = request.payload.get("category")
             data = request.payload.get("data", {})
             if category == "transport":
-                calc_req = TransportRequest(**data)
-                calc_res = calculate_transport(calc_req)
+                req = TransportRequest(**data)
+                calc_res = _calc_transport(req)
             elif category == "utility":
-                calc_req = UtilityRequest(**data)
-                calc_res = calculate_utility(calc_req)
+                req = UtilityRequest(**data)
+                calc_res = _calc_utility(req)
             elif category == "diet":
-                calc_req = DietRequest(**data)
-                calc_res = calculate_diet(calc_req)
+                req = DietRequest(**data)
+                calc_res = _calc_diet(req)
             else:
                 raise HTTPException(status_code=422, detail="Invalid or missing category in manual payload")
     except ValidationError as e:
-        # Catch Pydantic validation errors from bad payloads
         raise HTTPException(status_code=422, detail=str(e))
         
     return WebhookResponse(
@@ -232,14 +255,9 @@ def ingest_webhook(request: WebhookIngestRequest):
 # --- Nudge Engine Endpoint (Phase 3) ---
 
 @app.post("/api/v1/nudge/recommend", response_model=NudgeRecommendation)
-def get_nudge_recommendation(payload: UserContextPayload):
-    """
-    Analyzes the user's weekly carbon totals, recent behavior, 
-    and external live APIs (simulated) to return a single Micro-Action Nudge.
-    """
+def get_nudge_recommendation(payload: UserContextPayload, current_user: dict = Depends(get_current_user)):
     nudge = evaluate_nudges(payload)
     if not nudge:
-        # Fallback if no specific condition met
         nudge = NudgeRecommendation(
             action_id="act_general_01",
             headline="Turn off unused lights",
@@ -249,11 +267,7 @@ def get_nudge_recommendation(payload: UserContextPayload):
     return nudge
 
 @app.post("/api/v1/scan-receipt")
-async def scan_receipt(file: UploadFile = File(...)):
-    """
-    Phase 8: Accepts an image upload, processes it via OCR / Vision NLP,
-    and returns categorized carbon footprint items.
-    """
+async def scan_receipt(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     contents = await file.read()
     result = parse_receipt_image(contents)
     return result
@@ -264,11 +278,7 @@ class PlaidTransactionPayload(BaseModel):
     amount_cents: int
 
 @app.post("/api/v1/fintech/transaction")
-async def process_fintech_transaction(payload: PlaidTransactionPayload):
-    """
-    Phase 8: Webhook listener for Open Banking micro-transactions.
-    Rounds up to the nearest dollar and logs spare change for offset triggers.
-    """
+async def process_fintech_transaction(payload: PlaidTransactionPayload, current_user: dict = Depends(get_current_user)):
     result = eco_roundup_engine.process_transaction(payload.user_id, payload.amount_cents)
     return result
 

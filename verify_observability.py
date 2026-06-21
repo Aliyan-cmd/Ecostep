@@ -6,24 +6,37 @@ import time
 # Use the application's native TestClient
 client = TestClient(app)
 
+
+def _auth():
+    resp = client.post("/api/v1/auth/register", json={"email": "obs@test.com", "password": "TestPass123", "name": "Obs Test"})
+    if resp.status_code == 409:
+        resp = client.post("/api/v1/auth/login", json={"email": "obs@test.com", "password": "TestPass123"})
+    token = resp.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_telemetry_metrics_endpoint():
     """
     Test Case 1: Programmatically call the backend /metrics endpoint 
     under simulated stress load to verify standard throughput counters 
     and latency histograms update correctly without degrading application state.
     """
+    headers = _auth()
+
     # 1. Simulate a burst of valid traffic to generate latency histogram distributions
     for _ in range(10):
         client.post(
             "/calculate/transport",
-            json={"sub_category": "gasoline_car", "distance_miles": 10}
+            json={"sub_category": "gasoline_car", "distance_miles": 10},
+            headers=headers
         )
         
     # 2. Simulate some 422 Unprocessable Entity validation errors
     for _ in range(3):
         client.post(
             "/calculate/transport",
-            json={"sub_category": "invalid_type", "distance_miles": 10}
+            json={"sub_category": "invalid_type", "distance_miles": 10},
+            headers=headers
         )
 
     # 3. Scrape the raw /metrics endpoint exposed by OpenTelemetry middleware

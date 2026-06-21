@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  EcoStep — Google Cloud Run Production Deployment Script
-#  Project : ecostep-500014
+#  Project : ecostep-500015
 #  Region  : us-central1
 #
 #  Usage:
@@ -41,7 +41,7 @@ log_warn()  { echo -e "${YELLOW}⚠ $*${RESET}"; }
 log_error() { echo -e "${RED}✘ $*${RESET}" >&2; }
 
 # ── Configuration — edit these if you fork the project ───────────────────────
-PROJECT_ID="ecostep-500014"
+PROJECT_ID="ecostep-500015"
 REGION="us-central1"
 REGISTRY_REPO="ecostep-production"
 REGISTRY_HOST="${REGION}-docker.pkg.dev"
@@ -174,9 +174,7 @@ log_ok "Cloud Run unified image pushed successfully."
 # ── Grant the default Compute Service Account access to secrets ───────────────
 log_step "STEP 4 (pre-flight) — Granting Secret Manager access to Cloud Run identity"
 
-PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" \
-  --format="value(projectNumber)")
-COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+COMPUTE_SA="ecostep-runner@${PROJECT_ID}.iam.gserviceaccount.com"
 
 # Grant secretAccessor on each secret (idempotent — safe to re-run)
 for SECRET in "${SECRET_DEK}" "${SECRET_DB_URL}" "${SECRET_REDIS_URL}"; do
@@ -206,6 +204,7 @@ gcloud run deploy "${BACKEND_SERVICE}" \
   --platform=managed \
   --region="${REGION}" \
   --project="${PROJECT_ID}" \
+  --service-account="${COMPUTE_SA}" \
   --allow-unauthenticated \
   --port=8000 \
   --cpu=1 \
@@ -214,7 +213,7 @@ gcloud run deploy "${BACKEND_SERVICE}" \
   --max-instances=10 \
   --concurrency=80 \
   --timeout=300 \
-  --set-env-vars="ENV=production,PORT=8000,LOG_LEVEL=info" \
+  --set-env-vars="ENV=production,LOG_LEVEL=info" \
   --set-secrets="\
 ECOSTEP_DEK=${SECRET_DEK}:latest,\
 DB_URL=${SECRET_DB_URL}:latest,\
@@ -241,6 +240,7 @@ gcloud run deploy "${FRONTEND_SERVICE}" \
   --platform=managed \
   --region="${REGION}" \
   --project="${PROJECT_ID}" \
+  --service-account="${COMPUTE_SA}" \
   --allow-unauthenticated \
   --port=80 \
   --cpu=1 \
@@ -279,15 +279,16 @@ gcloud run deploy "${UNIFIED_SERVICE}" \
   --platform=managed \
   --region="${REGION}" \
   --project="${PROJECT_ID}" \
+  --service-account="${COMPUTE_SA}" \
   --allow-unauthenticated \
   --port=8080 \
-  --cpu=2 \
-  --memory=1Gi \
+  --cpu=1 \
+  --memory=512Mi \
   --min-instances=0 \
-  --max-instances=20 \
+  --max-instances=10 \
   --concurrency=100 \
   --timeout=300 \
-  --set-env-vars="ENV=production,PORT=8080,LOG_LEVEL=info" \
+  --set-env-vars="ENV=production,LOG_LEVEL=info" \
   --set-secrets="\
 ECOSTEP_DEK=${SECRET_DEK}:latest,\
 DB_URL=${SECRET_DB_URL}:latest,\
@@ -348,20 +349,31 @@ echo -e "  frontend → ${FRONTEND_IMAGE}"
 echo -e "  cloudrun → ${CLOUDRUN_IMAGE}"
 echo ""
 
-# Health check result evaluation
 ALL_OK=true
-for STATUS URL LABEL in \
-  "${UNIFIED_STATUS}"  "${UNIFIED_URL}"  "ecostep-app (unified)" \
-  "${BACKEND_STATUS}"  "${BACKEND_URL}"  "ecostep-backend-api" \
-  "${FRONTEND_STATUS}" "${FRONTEND_URL}" "ecostep-frontend-web"; do
-  if [[ "${STATUS}" == "200" || "${STATUS}" == "404" ]]; then
-    # 404 is acceptable for root of the API-only backend; docs are at /docs
-    log_ok "  ${LABEL} is reachable (HTTP ${STATUS})"
-  else
-    log_warn "  ${LABEL} returned HTTP ${STATUS} — verify manually."
-    ALL_OK=false
-  fi
-done
+
+# Check ecostep-app (unified)
+if [[ "${UNIFIED_STATUS}" == "200" || "${UNIFIED_STATUS}" == "404" ]]; then
+  log_ok "  ecostep-app (unified) is reachable (HTTP ${UNIFIED_STATUS})"
+else
+  log_warn "  ecostep-app (unified) returned HTTP ${UNIFIED_STATUS} — verify manually."
+  ALL_OK=false
+fi
+
+# Check ecostep-backend-api
+if [[ "${BACKEND_STATUS}" == "200" || "${BACKEND_STATUS}" == "404" ]]; then
+  log_ok "  ecostep-backend-api is reachable (HTTP ${BACKEND_STATUS})"
+else
+  log_warn "  ecostep-backend-api returned HTTP ${BACKEND_STATUS} — verify manually."
+  ALL_OK=false
+fi
+
+# Check ecostep-frontend-web
+if [[ "${FRONTEND_STATUS}" == "200" || "${FRONTEND_STATUS}" == "404" ]]; then
+  log_ok "  ecostep-frontend-web is reachable (HTTP ${FRONTEND_STATUS})"
+else
+  log_warn "  ecostep-frontend-web returned HTTP ${FRONTEND_STATUS} — verify manually."
+  ALL_OK=false
+fi
 
 echo ""
 if [[ "${ALL_OK}" == true ]]; then
